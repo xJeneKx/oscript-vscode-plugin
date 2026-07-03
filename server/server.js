@@ -33,9 +33,9 @@ documents.onDidOpen(change => {
 	validateTextDocument(change.document)
 })
 
-function inspectTextDocumentRules (textDocument) {
+function inspectTextDocumentRules (textDocument, rawParsed) {
 	const text = textDocument.getText()
-	const rawParsed = parseOjson.parseOjsonGrammar(text)
+	rawParsed = rawParsed || parseOjson.parseOjsonGrammar(text)
 
 	const checks = inspectRules(rawParsed.results[0])
 	return checks.map(c => c.toDiagnostic(textDocument))
@@ -47,15 +47,17 @@ async function validateTextDocument (textDocument) {
 	const text = textDocument.getText()
 	let diagnostics = []
 	let parsedOjson
+	let rawParsed
 
 	try {
 		parsedOjson = await promisify(parseOjson.parse)(text)
+		rawParsed = parseOjson.parseOjsonGrammar(text)
 		const template = parsedOjson[1]
 
 		if ('messages' in template) {
 			const aaAddress = objectHash.getChash160(parsedOjson)
 			const { complexity, count_ops: countOps } = await promisify(aaValidation.validateAADefinition)(parsedOjson)
-			const warnings = inspectTextDocumentRules(textDocument)
+			const warnings = inspectTextDocumentRules(textDocument, rawParsed)
 			diagnostics = [...diagnostics, ...warnings]
 			connection.sendRequest('aa-validation-success', { complexity, countOps, aaAddress })
 		} else {
@@ -70,58 +72,161 @@ async function validateTextDocument (textDocument) {
 			}
 		}
 	} catch (e) {
-		let message
 		const error = e.message || e
-		let range
-		if (error.match(/at line (\d+) col (\d+)/)) {
-			const match = error.match(/at line (\d+) col (\d+)/)
-			message = error
-			range = Range.create(
-				Number(match[1]) - 1,
-				Number(match[2]) - 1,
-				Number(match[1]) - 1,
-				Number.MAX_VALUE
-			)
-		} else if (error.match(/^validation of formula ([\s\S]+) failed: ([\s\S]+)/)) {
-			const match = error.match(/^validation of formula ([\s\S]+) failed: ([\s\S]+)/)
-			message = match[2]
-			if (message.indexOf('uninitialized local var') !== -1) {
-				const varMatch = message.match(/uninitialized local var (\w+)$/)
-				const variable = varMatch[1]
-				const start = text.indexOf(match[1])
-				const varPosition = match[1].search(new RegExp('\\$' + variable + '\\b'))
-				range = Range.create(
-					textDocument.positionAt(start + varPosition),
-					textDocument.positionAt(start + varPosition + variable.length + 1)
-				)
-			} else {
-				const start = text.indexOf(match[1])
-				range = Range.create(
-					textDocument.positionAt(start),
-					textDocument.positionAt(start + match[1].length)
-				)
-			}
-		} else {
-			message = error
-			range = Range.create(
-				0,
-				0,
-				Number.MAX_VALUE,
-				Number.MAX_VALUE
-			)
-		}
-
-		diagnostics.push({
-			range,
-			message: message.replace(/\t/g, ' '),
-			source: 'ocore',
-			severity: DiagnosticSeverity.Error
-		})
+		diagnostics.push(buildErrorDiagnostic(textDocument, error, rawParsed))
 		connection.sendRequest('aa-validation-error', { error })
 	}
 
 	connection.sendDiagnostics({ uri: textDocument.uri, diagnostics })
 	return parsedOjson
+}
+
+function buildErrorDiagnostic (textDocument, error, rawParsed) {
+	const formulaMatch = error.match(/^validation of formula ([\s\S]+) failed: ([\s\S]+)/)
+	let message
+	let range
+
+	if (formulaMatch) {
+		message = formulaMatch[2]
+		range = rangeForFormula(textDocument, formulaMatch[1], message, rawParsed)
+	} else if (error.match(/at line (\d+) col (\d+)/)) {
+		const match = error.match(/at line (\d+) col (\d+)/)
+		message = error
+		range = Range.create(
+			Number(match[1]) - 1,
+			Number(match[2]) - 1,
+			Number(match[1]) - 1,
+			Number.MAX_VALUE
+		)
+	} else {
+		message = error
+		range = Range.create(
+			0,
+			0,
+			Number.MAX_VALUE,
+			Number.MAX_VALUE
+		)
+	}
+
+	return {
+		range,
+		message: normalizeMessage(message).replace(/\t/g, ' '),
+		source: 'ocore',
+		severity: DiagnosticSeverity.Error
+	}
+}
+
+function rangeForFormula (textDocument, formula, message, rawParsed) {
+	const locations = collectFormulaLocations(rawParsed)
+		.filter(location => location.value === formula)
+	const location = selectFormulaLocation(locations, message)
+
+	if (location) {
+		const variable = getUninitializedVariable(message)
+		if (variable) {
+			const varPosition = formula.search(new RegExp('\\$' + variable + '\\b'))
+			if (varPosition !== -1) {
+				return Range.create(
+					textDocument.positionAt(location.context.offset + varPosition),
+					textDocument.positionAt(location.context.offset + varPosition + variable.length + 1)
+				)
+			}
+		}
+
+		return Range.create(
+			textDocument.positionAt(location.context.offset),
+			textDocument.positionAt(location.context.offset + formula.length)
+		)
+	}
+
+	const start = textDocument.getText().indexOf(formula)
+	if (start !== -1) {
+		const variable = getUninitializedVariable(message)
+		if (variable) {
+			const varPosition = formula.search(new RegExp('\\$' + variable + '\\b'))
+			if (varPosition !== -1) {
+				return Range.create(
+					textDocument.positionAt(start + varPosition),
+					textDocument.positionAt(start + varPosition + variable.length + 1)
+				)
+			}
+		}
+
+		return Range.create(
+			textDocument.positionAt(start),
+			textDocument.positionAt(start + formula.length)
+		)
+	}
+
+	return Range.create(0, 0, Number.MAX_VALUE, Number.MAX_VALUE)
+}
+
+function getUninitializedVariable (message) {
+	const match = message.match(/uninitialized local var (\w+)$/)
+	return match && match[1]
+}
+
+function selectFormulaLocation (locations, message) {
+	if (locations.length === 0) return null
+
+	if (message.indexOf('state var assignment not allowed here') !== -1) {
+		return locations.find(location => location.key === 'init') ||
+			locations.find(location => location.key !== 'state') ||
+			locations[0]
+	}
+
+	return locations[0]
+}
+
+function collectFormulaLocations (rawParsed) {
+	const root = rawParsed && Array.isArray(rawParsed.results)
+		? rawParsed.results[0]
+		: rawParsed
+	const locations = []
+
+	function visit (node, key) {
+		if (!node || typeof node !== 'object') return
+
+		if (node.type === parseOjson.TYPES.FORMULA) {
+			locations.push({ value: node.value, context: node.context, key })
+			return
+		}
+
+		if (node.type === parseOjson.TYPES.PAIR) {
+			visit(node.key, key)
+			visit(node.value, node.key && node.key.value)
+			return
+		}
+
+		if (Array.isArray(node.value)) {
+			node.value.forEach(child => visit(child, key))
+		}
+	}
+
+	visit(root)
+	return locations
+}
+
+function normalizeMessage (message) {
+	const invalidMatch = message.match(/^(?:statement|expr) [\s\S]+ invalid: ([\s\S]+)$/)
+	if (invalidMatch) {
+		message = invalidMatch[1]
+	}
+
+	if (message === 'state var assignment not allowed here') {
+		return 'State variable assignment is not allowed here'
+	}
+
+	const unexpectedMatch = message.match(/^(.*?at line \d+ col \d+):[\s\S]*?(Unexpected [^\n]+)/)
+	if (unexpectedMatch) {
+		return `${unexpectedMatch[1]}: ${unexpectedMatch[2]}`
+	}
+
+	if (message.match(/^uninitialized local var \w+$/)) {
+		return message.replace(/^uninitialized local var (\w+)$/, 'Uninitialized local variable $$$1')
+	}
+
+	return message
 }
 
 function checkDuplicateAgent (ojson, config) {
